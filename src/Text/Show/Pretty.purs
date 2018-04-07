@@ -2,10 +2,12 @@
 
 module Text.Show.Pretty
     ( prettify
+    , defaultOptions
     , FoldingOption(..)
     ) where
 
 import Prelude hiding (between)
+import Data.Array as A
 import Data.Either
 import Data.Foldable (for_)
 import Data.List
@@ -13,6 +15,7 @@ import Data.List.Lazy as LL
 import Data.Maybe
 import Data.String as Str
 import Data.Tuple
+import Control.MonadZero (guard)
 import Control.Alt ((<|>))
 import Control.Lazy (fix)
 import Text.Parsing.Parser (Parser, runParser)
@@ -26,10 +29,17 @@ import Control.Monad.RWS
 -- | Folding option for show.
 data FoldingOption = UnfoldLevel Int | FoldToWidth Int
 
+-- | Default options for `prettify` function
+defaultOptions = {
+    folding: FoldToWidth 0,
+    remove: [] }
+
 -- | Parse string and show it with options.
-prettify :: {folding :: FoldingOption} -> String -> String
+prettify :: {folding :: FoldingOption, remove :: Array String} -> String -> String
 prettify options str = case runParser str exprsParser of
-    Right expr -> prettyShow options expr
+    Right exprs -> prettyShow {folding: options.folding} $
+        removeFields (A.mapMaybe parseFieldPattern options.remove) $
+        if A.null options.remove then exprs else normalizeExprs exprs
     _ -> str
 
 
@@ -39,6 +49,11 @@ data Expr =
     | StringExpr String
     | CharExpr Char
     | ListExpr String String (List (List Expr))
+derive instance eqExpr :: Eq Expr
+
+isListExpr :: Expr -> Boolean
+isListExpr (ListExpr _ _ _) = true
+isListExpr _ = false
 
 -- | Parser for expressions.
 exprsParser :: Parser String (List Expr)
@@ -56,6 +71,42 @@ exprsParser =
     listExpr leftBracket rightBracket p = ListExpr leftBracket rightBracket <$>
         between (string leftBracket <* skipSpaces) (skipSpaces *> string rightBracket)
             (many p `sepBy` (try $ skipSpaces *> char ',' <* skipSpaces))
+
+-- | Join adjacent `Raw` exprs except `\n` string.
+normalizeExprs :: List Expr -> List Expr
+normalizeExprs Nil = Nil
+normalizeExprs (ListExpr l r ess : exprs) = ListExpr l r (map normalizeExprs ess)
+    : normalizeExprs exprs
+normalizeExprs exprs@(_:Nil) = exprs
+normalizeExprs (e1:es2@(e2:es3)) =
+    case (Tuple e1 e2) of
+        Tuple (Raw s1) (Raw s2) | s1 /= "\n" && s2 /= "\n" -> normalizeExprs $ Raw (s1 <> s2) : es3
+        _ -> e1 : normalizeExprs es2
+
+parseFieldPattern :: String -> Maybe (List Expr)
+parseFieldPattern str = do
+    exprs <- hush $ runParser str exprsParser
+    guard $ all (not <<< isListExpr) exprs -- ListExpr is not supported
+    pure $ normalizeExprs exprs
+
+-- | Recursively filter exprs by array of patterns.
+removeFields :: Array (List Expr) -> List Expr -> List Expr
+removeFields [] exprs = exprs
+removeFields _ Nil = Nil
+removeFields patterns (e:exprs) =
+    let e' = case e of
+            ListExpr l r ess -> ListExpr l r $
+                map (removeFields patterns) $
+                filter (\es -> all (\pattern -> not $ match pattern es) patterns) ess
+            _ -> e
+    in e' : removeFields patterns exprs
+
+-- | Match exprs against a pattern
+match :: List Expr -> List Expr -> Boolean
+match Nil _ = true
+match _ Nil = false
+match (Raw p:Nil) (Raw str:_) = Str.indexOf (Str.Pattern p) str == Just 0
+match (p:patterns) (e:exprs) = p == e && match patterns exprs
 
 
 type PrintState = {
@@ -138,8 +189,8 @@ prettyShow options exprs =
                                 Just MultiLineMode -> true
                                 _ -> false
                             _ -> false
-                    let len = if engaged then Str.length str else 0
-                    let stage = fromMaybe {tokens: Nil, column: state.column} state.stage'
+                        len = if engaged then Str.length str else 0
+                        stage = fromMaybe {tokens: Nil, column: state.column} state.stage'
                         stage2 = stage {tokens = token : stage.tokens, column = stage.column + len}
                     put state {stage' = Just stage2}
                     {folding} <- ask
